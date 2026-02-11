@@ -5,10 +5,10 @@ Main training node with rich frontend widget and WebSocket progress updates.
 Uses native ComfyUI MODEL type for the ACE-Step model.
 """
 
+import math
 import os
 import json
 import logging
-import time
 from pathlib import Path
 
 import torch
@@ -77,8 +77,15 @@ class PreprocessedTensorDataset(Dataset):
 
     def __getitem__(self, idx):
         sample_info = self.samples[idx]
-        tensor_path = self.tensor_dir / sample_info["filename"]
-        return torch.load(tensor_path)
+        # Handle both dict format (from our manifest) and string format (sdbds manifest)
+        if isinstance(sample_info, dict):
+            filename = sample_info["filename"]
+        else:
+            # sdbds stores relative paths like "./datasets/preprocessed_tensors\xyz.pt"
+            # Extract just the filename to avoid path doubling
+            filename = Path(sample_info).name
+        tensor_path = self.tensor_dir / filename
+        return torch.load(tensor_path, weights_only=False)
 
 
 def collate_fn(batch):
@@ -209,40 +216,6 @@ class FL_AceStep_Train:
         # Verify this is an ACE-Step model
         if not is_acestep_model(model):
             return (model, "", "Error: Model is not an ACE-Step model")
-
-        # ========== EXTENSIVE GRADIENT ENVIRONMENT DEBUG ==========
-        logger.info("=" * 60)
-        logger.info("GRADIENT ENVIRONMENT DEBUG - INITIAL STATE")
-        logger.info("=" * 60)
-        logger.info(f"  torch.is_grad_enabled(): {torch.is_grad_enabled()}")
-        logger.info(f"  torch.is_inference_mode_enabled(): {torch.is_inference_mode_enabled()}")
-
-        # Test tensor to see current grad behavior
-        test_tensor = torch.tensor([1.0, 2.0, 3.0], requires_grad=True)
-        test_result = test_tensor * 2
-        logger.info(f"  Test tensor (requires_grad=True) * 2:")
-        logger.info(f"    test_tensor.requires_grad: {test_tensor.requires_grad}")
-        logger.info(f"    test_result.requires_grad: {test_result.requires_grad}")
-        logger.info(f"    test_result.grad_fn: {test_result.grad_fn}")
-
-        # CRITICAL: ComfyUI may use inference_mode which CANNOT be overridden by enable_grad()
-        # We need to explicitly exit inference mode if active
-        inference_mode_was_active = torch.is_inference_mode_enabled()
-        logger.info(f"  Inference mode was active: {inference_mode_was_active}")
-
-        # Try to enable gradients
-        torch.set_grad_enabled(True)
-        logger.info(f"  After torch.set_grad_enabled(True):")
-        logger.info(f"    torch.is_grad_enabled(): {torch.is_grad_enabled()}")
-        logger.info(f"    torch.is_inference_mode_enabled(): {torch.is_inference_mode_enabled()}")
-
-        # Test again after set_grad_enabled
-        test_tensor2 = torch.tensor([1.0, 2.0, 3.0], requires_grad=True)
-        test_result2 = test_tensor2 * 2
-        logger.info(f"  Test after set_grad_enabled(True):")
-        logger.info(f"    test_result2.requires_grad: {test_result2.requires_grad}")
-        logger.info(f"    test_result2.grad_fn: {test_result2.grad_fn}")
-        logger.info("=" * 60)
 
         lora_config = config["lora"]
         training_config = config["training"]
@@ -557,101 +530,31 @@ class FL_AceStep_Train:
 
             logger.info("All module and buffer cloning complete - inference tensor taint removed")
 
-            # DEBUG: List all Linear modules in decoder to verify target_modules names
-            linear_modules = []
-            for name, module in decoder.named_modules():
-                if isinstance(module, torch.nn.Linear):
-                    linear_modules.append(name)
-            logger.info(f"Linear modules in decoder (first 30): {linear_modules[:30]}")
-
-            # Check if target_modules exist
-            target_modules_found = []
-            for target in lora_config.target_modules:
-                matching = [m for m in linear_modules if target in m]
-                target_modules_found.append((target, len(matching)))
-            logger.info(f"Target modules search results: {target_modules_found}")
-
             # Wrap decoder with LoRA
             decoder = get_peft_model(decoder, peft_config)
             decoder = decoder.to(device).to(dtype)
             decoder.train()
 
-            # DEBUG: Check PEFT model immediately after creation
-            logger.info(f"PEFT model created: {type(decoder).__name__}")
-            logger.info(f"PEFT model modules count: {len(list(decoder.modules()))}")
-
-            # Verify LoRA parameters exist and have gradients
-            lora_params_after_peft = []
-            for n, p in decoder.named_parameters():
-                if 'lora_' in n.lower():
-                    lora_params_after_peft.append((n, p.requires_grad, p.shape))
-            logger.info(f"LoRA params after PEFT wrapping: {len(lora_params_after_peft)}")
-            if len(lora_params_after_peft) == 0:
-                logger.error("CRITICAL: No LoRA parameters found! PEFT injection may have failed!")
-                logger.error("Check if target modules exist in the decoder model.")
-                # List available modules for debugging
-                available_modules = [n for n, m in decoder.named_modules() if isinstance(m, torch.nn.Linear)]
-                logger.error(f"Available Linear modules: {available_modules[:20]}")
+            # Verify LoRA parameters exist
+            lora_param_count = sum(1 for n, p in decoder.named_parameters() if 'lora_' in n.lower() and p.requires_grad)
+            if lora_param_count == 0:
+                logger.error("No LoRA parameters found! PEFT injection may have failed.")
+                return (model, str(output_dir), "Error: No LoRA parameters found after PEFT injection")
 
             # Update model reference
             dit.decoder = decoder
 
-            # Freeze all non-LoRA parameters in the DECODER (CRITICAL for gradient flow)
-            # PEFT should handle this, but we do it explicitly to be safe
-            # We iterate over the decoder's parameters, not dit's, to ensure proper naming
-            lora_param_count = 0
-            frozen_param_count = 0
-            lora_param_names = []
+            # Freeze all non-LoRA parameters explicitly
             for name, param in decoder.named_parameters():
-                # PEFT LoRA params can be named:
-                # - lora_A, lora_B (direct)
-                # - or under base_model.model.*.lora_A.default.weight
-                if 'lora_' in name.lower() or 'lora_a' in name.lower() or 'lora_b' in name.lower():
+                if 'lora_' in name.lower():
                     param.requires_grad = True
-                    lora_param_count += 1
-                    lora_param_names.append(name)
                 else:
                     param.requires_grad = False
-                    frozen_param_count += 1
-
-            logger.info(f"LoRA params with requires_grad=True: {lora_param_count}")
-            logger.info(f"Frozen params with requires_grad=False: {frozen_param_count}")
-            logger.info(f"First 10 LoRA param names: {lora_param_names[:10]}")
-
-            # DEBUG: Print some LoRA parameter names to verify they exist
-            lora_params_debug = [(n, p.requires_grad, p.shape) for n, p in decoder.named_parameters() if 'lora_' in n.lower()][:5]
-            for name, req_grad, shape in lora_params_debug:
-                logger.info(f"  LoRA param: {name}, requires_grad={req_grad}, shape={shape}")
-
-            # DEBUG: Check PEFT model status
-            logger.info(f"PEFT decoder type: {type(decoder).__name__}")
-            logger.info(f"PEFT decoder training mode: {decoder.training}")
-            if hasattr(decoder, 'peft_config'):
-                logger.info(f"PEFT config: {decoder.peft_config}")
-            if hasattr(decoder, 'active_adapters'):
-                logger.info(f"Active adapters: {decoder.active_adapters}")
-            if hasattr(decoder, 'base_model'):
-                logger.info(f"Base model type: {type(decoder.base_model).__name__}")
-
-            # DEBUG: Check if PEFT actually injected LoRA layers
-            # Look for LoraLayer modules
-            lora_layers_found = []
-            for name, module in decoder.named_modules():
-                class_name = type(module).__name__
-                if 'lora' in class_name.lower() or 'Lora' in class_name:
-                    lora_layers_found.append((name, class_name))
-            logger.info(f"LoRA layers found in model: {len(lora_layers_found)}")
-            for name, cls in lora_layers_found[:5]:
-                logger.info(f"  {name}: {cls}")
-
-            # Note: text_projector is no longer needed here.
-            # Preprocessing now runs the full condition encoder (text_projector + lyric_encoder
-            # + pack_sequences) to produce combined 2048-dim encoder_hidden_states.
 
             # Log trainable params
             trainable_params = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
             total_params = sum(p.numel() for p in decoder.parameters())
-            logger.info(f"Trainable params: {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.2f}%)")
+            logger.info(f"LoRA injected: {trainable_params:,} / {total_params:,} trainable ({100*trainable_params/total_params:.2f}%)")
 
         except ImportError:
             return (model, str(output_dir), "Error: PEFT not installed")
@@ -667,14 +570,17 @@ class FL_AceStep_Train:
             logger.error("CRITICAL: No trainable parameters for optimizer!")
             return (model, str(output_dir), "Error: No trainable LoRA parameters found")
 
-        optimizer = AdamW(
-            trainable_param_list,
-            lr=training_config.learning_rate,
-            weight_decay=training_config.weight_decay,
-        )
+        optimizer_kwargs = {
+            "lr": training_config.learning_rate,
+            "weight_decay": training_config.weight_decay,
+        }
+        if device.type == "cuda":
+            optimizer_kwargs["fused"] = True
+        optimizer = AdamW(trainable_param_list, **optimizer_kwargs)
 
-        # Setup scheduler
-        total_steps = training_config.max_epochs * len(dataloader)
+        # Setup scheduler — total_steps counts OPTIMIZER steps, not micro-batches
+        steps_per_epoch = max(1, math.ceil(len(dataloader) / training_config.gradient_accumulation_steps))
+        total_steps = steps_per_epoch * training_config.max_epochs
         warmup_scheduler = LinearLR(
             optimizer,
             start_factor=0.1,
@@ -724,35 +630,17 @@ class FL_AceStep_Train:
         # Progress bar
         pbar = ProgressBar(total_steps) if ProgressBar else None
 
-        # Training loop - MUST be inside inference_mode(False) AND enable_grad() context
-        # ComfyUI may use inference_mode which CANNOT be overridden by enable_grad() alone
-        # inference_mode(False) disables inference mode, then enable_grad() enables grad tracking
-        logger.info("=" * 60)
-        logger.info("ENTERING TRAINING LOOP - SETTING UP GRAD CONTEXT")
-        logger.info("=" * 60)
-        logger.info(f"  Before context: grad_enabled={torch.is_grad_enabled()}, inference_mode={torch.is_inference_mode_enabled()}")
-
+        # Training loop - inference_mode(False) + enable_grad() required for ComfyUI
         with torch.inference_mode(False):
-            logger.info(f"  Inside inference_mode(False): grad_enabled={torch.is_grad_enabled()}, inference_mode={torch.is_inference_mode_enabled()}")
             with torch.enable_grad():
-                logger.info(f"  Inside enable_grad(): grad_enabled={torch.is_grad_enabled()}, inference_mode={torch.is_inference_mode_enabled()}")
-
-                # Final test before training
-                final_test = torch.tensor([1.0, 2.0], requires_grad=True)
-                final_result = final_test * 3
-                logger.info(f"  Final test: result.requires_grad={final_result.requires_grad}, grad_fn={final_result.grad_fn}")
-
-                if final_result.grad_fn is None:
-                    logger.error("CRITICAL: Still no gradient tracking even inside inference_mode(False) + enable_grad()!")
-                    logger.error("This suggests a deeper issue with PyTorch or ComfyUI's context management.")
-                else:
-                    logger.info("SUCCESS: Gradient tracking is now working!")
-
-                logger.info("=" * 60)
+                # Initialize gradient accumulation state (matches sdbds reference)
+                accumulation_step = 0
+                accumulated_loss = 0.0
+                optimizer.zero_grad(set_to_none=True)
 
                 for epoch in range(start_epoch, training_config.max_epochs):
                     epoch_loss = 0.0
-                    num_steps = 0
+                    num_updates = 0
 
                     for batch in dataloader:
                         # Move to device
@@ -776,68 +664,8 @@ class FL_AceStep_Train:
                         t_expanded = t.unsqueeze(-1).unsqueeze(-1)  # [B, 1, 1]
                         xt = t_expanded * x1 + (1.0 - t_expanded) * x0
 
-                        # DEBUG BEFORE FORWARD PASS (first step only)
-                        if global_step == 0:
-                            logger.info("=" * 60)
-                            logger.info("DEBUG: STATE BEFORE FORWARD PASS")
-                            logger.info("=" * 60)
-                            logger.info(f"  torch.is_grad_enabled(): {torch.is_grad_enabled()}")
-                            logger.info(f"  torch.is_inference_mode_enabled(): {torch.is_inference_mode_enabled()}")
-
-                            # Quick test
-                            quick_test = torch.tensor([1.0], device=device, requires_grad=True) * 2
-                            logger.info(f"  Quick test (tensor * 2): requires_grad={quick_test.requires_grad}, grad_fn={quick_test.grad_fn}")
-
-                            # Input tensor states
-                            logger.info(f"  xt.requires_grad: {xt.requires_grad}")
-                            logger.info(f"  encoder_hidden_states.requires_grad: {encoder_hidden_states.requires_grad}")
-
-                            # Check decoder state
-                            logger.info(f"  dit.decoder.training: {dit.decoder.training}")
-
-                            # Count parameters requiring grad
-                            params_with_grad = sum(1 for p in dit.decoder.parameters() if p.requires_grad)
-                            total_params = sum(1 for p in dit.decoder.parameters())
-                            logger.info(f"  Decoder params requiring grad: {params_with_grad}/{total_params}")
-
-                            # Sample LoRA parameter
-                            sample_lora = None
-                            for n, p in dit.decoder.named_parameters():
-                                if 'lora_' in n.lower() and p.requires_grad:
-                                    sample_lora = (n, p)
-                                    break
-                            if sample_lora:
-                                logger.info(f"  Sample LoRA param: {sample_lora[0]}")
-                                logger.info(f"    requires_grad: {sample_lora[1].requires_grad}")
-                                logger.info(f"    device: {sample_lora[1].device}")
-                                logger.info(f"    dtype: {sample_lora[1].dtype}")
-
-                            logger.info("=" * 60)
-
-                        # Forward pass through the PEFT-wrapped decoder
-                        # Use dit.decoder which is the PEFT-wrapped model
-                        # Wrap in autocast for bf16 mixed precision training
+                        # Forward pass with mixed precision
                         try:
-                            # DEBUG: Try forward pass WITHOUT autocast on first step to isolate issue
-                            if global_step == 0:
-                                logger.info("Attempting forward pass WITHOUT autocast for debugging...")
-                                # Make a copy for debug test
-                                xt_debug = xt.clone().requires_grad_(True)
-                                try:
-                                    debug_outputs = dit.decoder(
-                                        hidden_states=xt_debug,
-                                        timestep=t,
-                                        timestep_r=t,
-                                        attention_mask=attention_mask,
-                                        encoder_hidden_states=encoder_hidden_states,
-                                        encoder_attention_mask=encoder_attention_mask,
-                                        context_latents=context_latents,
-                                    )
-                                    debug_out = debug_outputs[0] if isinstance(debug_outputs, tuple) else debug_outputs
-                                    logger.info(f"  DEBUG forward (no autocast): output.requires_grad={debug_out.requires_grad}, grad_fn={debug_out.grad_fn}")
-                                except Exception as debug_e:
-                                    logger.error(f"  DEBUG forward failed: {debug_e}")
-
                             with torch.autocast(device_type='cuda', dtype=dtype):
                                 decoder_outputs = dit.decoder(
                                     hidden_states=xt,
@@ -849,108 +677,83 @@ class FL_AceStep_Train:
                                     context_latents=context_latents,
                                 )
 
-                            # Extract output OUTSIDE autocast
-                            predicted_v = decoder_outputs[0] if isinstance(decoder_outputs, tuple) else decoder_outputs
+                                # Compute loss INSIDE autocast (matches sdbds reference)
+                                predicted_v = decoder_outputs[0] if isinstance(decoder_outputs, tuple) else decoder_outputs
+                                flow = x1 - x0  # Target velocity
+                                diffusion_loss = F.mse_loss(predicted_v, flow)
 
-                            # Flow matching loss (compute outside autocast for gradient stability)
-                            flow = x1 - x0  # Target velocity
-                            loss = F.mse_loss(predicted_v.float(), flow.float())
-
-                            # DEBUG: Check gradient tracking (only on first step)
-                            if global_step == 0:
-                                logger.info(f"DEBUG gradient tracking AFTER forward pass:")
-                                logger.info(f"  xt.requires_grad: {xt.requires_grad}, grad_fn: {xt.grad_fn}")
-                                logger.info(f"  decoder_outputs type: {type(decoder_outputs)}")
-                                if isinstance(decoder_outputs, tuple):
-                                    logger.info(f"  decoder_outputs[0].requires_grad: {decoder_outputs[0].requires_grad}, grad_fn: {decoder_outputs[0].grad_fn}")
-                                logger.info(f"  predicted_v.requires_grad: {predicted_v.requires_grad}, grad_fn: {predicted_v.grad_fn}")
-                                logger.info(f"  predicted_v.dtype: {predicted_v.dtype}, shape: {predicted_v.shape}")
-                                logger.info(f"  flow.requires_grad: {flow.requires_grad}, grad_fn: {flow.grad_fn}")
-                                logger.info(f"  loss.requires_grad: {loss.requires_grad}, grad_fn: {loss.grad_fn}")
-                                logger.info(f"  loss value: {loss.item()}")
-
-                                # Check if any LoRA params require grad
-                                lora_with_grad = [(n, p.requires_grad) for n, p in dit.decoder.named_parameters() if 'lora_' in n.lower()][:5]
-                                logger.info(f"  LoRA params (during forward): {lora_with_grad}")
-
-                                # If loss doesn't have grad_fn, trace back to find where gradients are lost
-                                if loss.grad_fn is None:
-                                    logger.error("CRITICAL: loss.grad_fn is None - gradients not tracked!")
-                                    logger.error("This means no trainable parameters were used in computing the loss.")
-                                    logger.error("Checking predicted_v.grad_fn to trace the issue...")
-                                    if predicted_v.grad_fn is None:
-                                        logger.error("predicted_v.grad_fn is also None - forward pass didn't track gradients!")
+                            # Cast to fp32 for stable backward pass
+                            loss = diffusion_loss.float()
 
                         except Exception as e:
                             logger.warning(f"Forward pass error: {e}")
-                            import traceback
-                            traceback.print_exc()
                             continue
 
-                        # Loss is already float32 from explicit conversion above
-                        # (We computed F.mse_loss(predicted_v.float(), flow.float()))
+                        # Backward with gradient accumulation
+                        scaled_loss = loss / training_config.gradient_accumulation_steps
+                        scaled_loss.backward()
+                        accumulated_loss += loss.item()
+                        accumulation_step += 1
 
-                        # DEBUG: Check loss state
-                        if global_step == 0:
-                            logger.info(f"  Loss before backward - loss.requires_grad: {loss.requires_grad}, grad_fn: {loss.grad_fn}")
-
-                        # Backward
-                        loss = loss / training_config.gradient_accumulation_steps
-
-                        # DEBUG: Check loss after division
-                        if global_step == 0:
-                            logger.info(f"  After division - loss.requires_grad: {loss.requires_grad}, grad_fn: {loss.grad_fn}")
-
-                        try:
-                            loss.backward()
-                        except RuntimeError as e:
-                            logger.error(f"Backward pass failed: {e}")
-                            # Print more diagnostic info
-                            logger.error(f"  loss value: {loss.item()}")
-                            logger.error(f"  loss.requires_grad: {loss.requires_grad}")
-                            logger.error(f"  loss.grad_fn: {loss.grad_fn}")
-                            # Check if any parameters have gradients
-                            has_grad = sum(1 for p in decoder.parameters() if p.grad is not None)
-                            logger.error(f"  Parameters with gradients: {has_grad}")
-                            raise
-
-                        epoch_loss += loss.item() * training_config.gradient_accumulation_steps
-                        num_steps += 1
-                        global_step += 1
-
-                        # Optimizer step
-                        if global_step % training_config.gradient_accumulation_steps == 0:
+                        # Optimizer step when accumulation window is full
+                        if accumulation_step >= training_config.gradient_accumulation_steps:
                             torch.nn.utils.clip_grad_norm_(
                                 decoder.parameters(),
                                 training_config.max_grad_norm
                             )
                             optimizer.step()
                             scheduler.step()
-                            optimizer.zero_grad()
+                            optimizer.zero_grad(set_to_none=True)
+                            global_step += 1
 
-                        # Update progress
+                            avg_step_loss = accumulated_loss / accumulation_step
+                            epoch_loss += avg_step_loss
+                            num_updates += 1
+
+                            # Track and send progress
+                            loss_history.append({
+                                "step": global_step,
+                                "loss": avg_step_loss,
+                            })
+                            send_training_update(unique_id, {
+                                "type": "progress",
+                                "epoch": epoch + 1,
+                                "total_epochs": training_config.max_epochs,
+                                "step": global_step,
+                                "loss": avg_step_loss,
+                                "lr": scheduler.get_last_lr()[0],
+                                "loss_history": loss_history,
+                            })
+
+                            if pbar:
+                                pbar.update(1)
+
+                            accumulated_loss = 0.0
+                            accumulation_step = 0
+
+                    # Epoch end: flush remaining accumulated gradients
+                    if accumulation_step > 0:
+                        torch.nn.utils.clip_grad_norm_(
+                            decoder.parameters(),
+                            training_config.max_grad_norm
+                        )
+                        optimizer.step()
+                        scheduler.step()
+                        optimizer.zero_grad(set_to_none=True)
+                        global_step += 1
+
+                        avg_step_loss = accumulated_loss / accumulation_step
+                        epoch_loss += avg_step_loss
+                        num_updates += 1
+
                         if pbar:
                             pbar.update(1)
 
-                        # Track loss history (every step for full graph)
-                        loss_history.append({
-                            "step": global_step,
-                            "loss": loss.item() * training_config.gradient_accumulation_steps
-                        })
-
-                        # Send progress update (every step for immediate feedback)
-                        send_training_update(unique_id, {
-                            "type": "progress",
-                            "epoch": epoch + 1,
-                            "total_epochs": training_config.max_epochs,
-                            "step": global_step,
-                            "loss": loss.item() * training_config.gradient_accumulation_steps,
-                            "lr": scheduler.get_last_lr()[0],
-                            "loss_history": loss_history,  # Full history for accumulating graph
-                        })
+                        accumulated_loss = 0.0
+                        accumulation_step = 0
 
                     # Epoch complete
-                    avg_loss = epoch_loss / max(num_steps, 1)
+                    avg_loss = epoch_loss / max(num_updates, 1)
                     logger.info(f"Epoch {epoch + 1}/{training_config.max_epochs} | Loss: {avg_loss:.6f}")
 
                     # Save checkpoint
@@ -969,7 +772,7 @@ class FL_AceStep_Train:
                             "loss": avg_loss,
                         })
 
-                # Save final checkpoint (still inside inference_mode(False) + enable_grad())
+                # Save final checkpoint
                 final_dir = output_dir / "final"
                 self._save_checkpoint(
                     decoder, optimizer, scheduler,
@@ -1018,10 +821,6 @@ class FL_AceStep_Train:
             # Get the PEFT state dict
             peft_state_dict = get_peft_model_state_dict(model)
 
-            # Debug: Log what PEFT produces BEFORE transformation
-            raw_sample = list(peft_state_dict.keys())[:3]
-            logger.info(f"PEFT raw state dict sample (BEFORE fix): {raw_sample}")
-
             # Fix key names - handle double base_model.model. prefix
             # PEFT produces: base_model.model.base_model.model.layers.X...
             # ComfyUI expects: base_model.model.layers.X...
@@ -1034,10 +833,6 @@ class FL_AceStep_Train:
                     new_key = new_key.replace("base_model.model.base_model.model.", "base_model.model.", 1)
 
                 fixed_state_dict[new_key] = value
-
-            # Debug: Log what keys look like AFTER transformation
-            fixed_sample = list(fixed_state_dict.keys())[:3]
-            logger.info(f"Fixed state dict sample (AFTER fix): {fixed_sample}")
 
             # Save in safetensors format (preferred by ComfyUI)
             save_file(fixed_state_dict, str(adapter_dir / "adapter_model.safetensors"))
@@ -1058,12 +853,7 @@ class FL_AceStep_Train:
                 with open(adapter_dir / "adapter_config.json", "w") as f:
                     json.dump(config_dict, f, indent=2)
 
-            logger.info(f"Saved LoRA adapter to {adapter_dir}")
-            logger.info(f"Fixed {len(fixed_state_dict)} LoRA keys for ComfyUI compatibility")
-
-            # Log sample keys for verification
-            sample_keys = list(fixed_state_dict.keys())[:3]
-            logger.info(f"Sample fixed keys: {sample_keys}")
+            logger.info(f"Saved LoRA adapter to {adapter_dir} ({len(fixed_state_dict)} keys)")
         except Exception as e:
             logger.warning(f"Could not save adapter: {e}")
             import traceback
