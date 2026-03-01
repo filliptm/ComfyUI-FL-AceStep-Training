@@ -4,6 +4,7 @@ LoRA training nodes for ComfyUI powered by [ACE-Step 1.5](https://github.com/ace
 
 [![ACE-Step](https://img.shields.io/badge/ACE--Step-Original%20Repo-blue?style=for-the-badge&logo=github&logoColor=white)](https://github.com/ace-step/ACE-Step-1.5)
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-Custom%20Nodes-green?style=for-the-badge&logo=github&logoColor=white)](https://github.com/comfyanonymous/ComfyUI)
+[![Patreon](https://img.shields.io/badge/Patreon-Support%20Me-F96854?style=for-the-badge&logo=patreon&logoColor=white)](https://www.patreon.com/Machinedelusions)
 
 ![Workflow Preview](assets/workflow_preview.png)
 
