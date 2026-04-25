@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fl-acestep-training"
-version = "1.3.0"
+version = "1 3 1"
 description = "FL AceStep Training - LoRA Training nodes for ACE-Step 1.5 in ComfyUI"
 readme = "README.md"
 license = {text = "MIT"}
@@ -63,4 +63,4 @@ line_length = 100
 [tool.comfy]
 PublisherId = "machinedelusions"
 DisplayName = "FL AceStep Training"
-Icon = ""
+Icon = "https://avatars.githubusercontent.com/u/55672949"
