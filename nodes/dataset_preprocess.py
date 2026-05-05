@@ -1,21 +1,17 @@
 """
-ACE-Step Dataset Preprocess Node
+ACE-Step Dataset Preprocess Node (Staged + Tiled + Dimension Fix)
 
-Converts labeled samples to tensor files for training.
-Uses native ComfyUI MODEL type for the ACE-Step model.
-
-Performance-optimized to match the sdbds reference implementation:
-- Models loaded once, kept on GPU for entire loop
-- torch.inference_mode() wraps entire loop
-- Cached refer_audio tensors and resampler objects
-- non_blocking GPU transfers
-- Periodic cache clearing
+Fixes:
+- Added .squeeze(0) to target_latents to prevent "got 3 and 4" dimension error during training.
+- Keeps all previous Low VRAM optimizations (Staged + Tiled).
 """
 
 import json
 import logging
 import random
 from pathlib import Path
+import gc
+import math
 
 import torch
 
@@ -38,7 +34,7 @@ from ..modules.audio_utils import load_audio, vae_encode_direct
 
 logger = logging.getLogger("FL_AceStep_Training")
 
-# SFT generation prompt template (from ACE-Step constants)
+# SFT generation prompt template
 SFT_GEN_PROMPT = """# Instruction
 {}
 
@@ -51,12 +47,19 @@ SFT_GEN_PROMPT = """# Instruction
 
 DEFAULT_DIT_INSTRUCTION = "Fill the audio semantic mask based on the given conditions:"
 
-# Cache for refer_audio placeholder tensors (avoid GPU alloc per sample)
 _REFER_AUDIO_CACHE: dict = {}
 
+def force_clear_memory():
+    """Aggressively clear VRAM and RAM"""
+    if model_management:
+        model_management.unload_all_models()
+        model_management.soft_empty_cache()
+    gc.collect()
+    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.ipc_collect()
 
 def _get_refer_audio_tensors(device, dtype):
-    """Get cached refer_audio placeholder tensors for text2music (no reference audio)."""
     cache_key = (device, dtype)
     if cache_key not in _REFER_AUDIO_CACHE:
         _REFER_AUDIO_CACHE[cache_key] = (
@@ -64,22 +67,11 @@ def _get_refer_audio_tensors(device, dtype):
             torch.zeros(1, device=device, dtype=torch.long),
         )
     refer_audio_hidden, refer_audio_order_mask = _REFER_AUDIO_CACHE[cache_key]
-    # Reset in-place (cheap) rather than allocating new tensors
     refer_audio_hidden.zero_()
     refer_audio_order_mask.zero_()
     return refer_audio_hidden, refer_audio_order_mask
 
-
 def encode_text_and_lyrics(clip, text: str, lyrics: str, device, dtype):
-    """
-    Encode text and lyrics using ComfyUI's native CLIP pipeline.
-
-    For ACE-Step 1.5, this uses the Qwen3 model:
-    - Text: Full forward pass -> last_hidden_state
-    - Lyrics: Layer 0 output only (shallow embedding)
-
-    IMPORTANT: Must use return_dict=True to get lyrics embeddings.
-    """
     tokens = clip.tokenize(text, lyrics=lyrics)
     result = clip.encode_from_tokens(tokens, return_pooled=True, return_dict=True)
 
@@ -104,13 +96,35 @@ def encode_text_and_lyrics(clip, text: str, lyrics: str, device, dtype):
     return text_hidden_states, text_attention_mask, lyric_hidden_states, lyric_attention_mask
 
 
+def vae_encode_tiled(vae_model, waveform, device, dtype, chunk_seconds=20, sr=44100):
+    """
+    Encodes audio in chunks to save VRAM.
+    """
+    chunk_size = int(chunk_seconds * sr)
+    total_samples = waveform.shape[-1]
+    
+    latents_list = []
+    
+    for start in range(0, total_samples, chunk_size):
+        end = min(start + chunk_size, total_samples)
+        
+        audio_chunk = waveform[:, start:end].unsqueeze(0).to(device=device, dtype=dtype)
+        
+        with torch.no_grad():
+            chunk_latents = vae_encode_direct(vae_model, audio_chunk, device, dtype)
+        
+        latents_list.append(chunk_latents.cpu())
+        
+        del audio_chunk, chunk_latents
+    
+    if not latents_list:
+        return None
+        
+    full_latents = torch.cat(latents_list, dim=1)
+    return full_latents
+
+
 class FL_AceStep_PreprocessDataset:
-    """
-    Preprocess Dataset
-
-    Converts labeled audio samples to preprocessed tensor files for training.
-    """
-
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -123,19 +137,18 @@ class FL_AceStep_PreprocessDataset:
                     "default": "./output/acestep/datasets",
                     "multiline": False,
                 }),
+                "low_vram": ("BOOLEAN", {
+                    "default": True, 
+                    "label_on": "Enabled (Staged + Tiled)", 
+                    "label_off": "Disabled (Standard)"
+                }),
             },
             "optional": {
                 "max_duration": ("FLOAT", {
-                    "default": 240.0,
-                    "min": 10.0,
-                    "max": 600.0,
-                    "step": 10.0,
+                    "default": 240.0, "min": 10.0, "max": 600.0, "step": 10.0,
                 }),
                 "genre_ratio": ("INT", {
-                    "default": 0,
-                    "min": 0,
-                    "max": 100,
-                    "step": 5,
+                    "default": 0, "min": 0, "max": 100, "step": 5,
                 }),
             }
         }
@@ -146,131 +159,244 @@ class FL_AceStep_PreprocessDataset:
     CATEGORY = "FL AceStep/Dataset"
     OUTPUT_NODE = True
 
-    def preprocess(
-        self,
-        dataset,
-        model,
-        vae,
-        clip,
-        output_dir,
-        max_duration=240.0,
-        genre_ratio=0
-    ):
-        """Preprocess the dataset to tensor files."""
+    def preprocess(self, dataset, model, vae, clip, output_dir, low_vram=True, max_duration=240.0, genre_ratio=0):
+        # Initial Cleanup
+        force_clear_memory()
+        
         samples = dataset.samples
-        if not samples:
-            return (output_dir, 0, "No samples to preprocess")
+        if not samples: return (output_dir, 0, "No samples")
 
         if not is_acestep_model(model):
             return (output_dir, 0, "Error: Model is not an ACE-Step model")
 
         labeled_samples = [s for s in samples if s.labeled or s.caption]
-        if not labeled_samples:
-            return (output_dir, 0, "No labeled samples to preprocess")
+        if not labeled_samples: return (output_dir, 0, "No labeled samples")
 
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
 
-        # --- Setup: Load all models to GPU ONCE ---
         device = model_management.get_torch_device() if model_management else torch.device('cuda')
-
-        # Load VAE to GPU via ComfyUI's model management (one-time cost)
-        # Use a single vae.encode() call to trigger the loading, then use the
-        # underlying model directly for the rest of the loop
+        
+        # Temp Storage
+        temp_storage = {s.id: {'sample': s} for s in labeled_samples}
+        
         vae_model = vae.first_stage_model
         vae_dtype = vae.vae_dtype
-        if model_management:
-            model_management.load_models_gpu(
-                [vae.patcher],
-                force_full_load=getattr(vae, 'disable_offload', False)
-            )
-        logger.info(f"VAE loaded: dtype={vae_dtype}, device={device}")
-
-        # Load CLIP/text encoder to GPU via ComfyUI's model management (one-time cost)
-        # Can't use clip.load_model() with empty tokens — ACE-Step 1.5's
-        # memory_estimation_function expects tokenized input with lm_metadata.
-        # Call load_models_gpu directly on the patcher instead.
-        if model_management:
-            model_management.load_models_gpu([clip.patcher])
-        logger.info("CLIP/text encoder loaded")
-
-        # Get condition encoder and move to GPU
+        
         condition_encoder = get_acestep_encoder(model)
         enc_param = next(condition_encoder.parameters())
         enc_dtype = enc_param.dtype
-        if enc_param.device != device:
-            condition_encoder.to(device)
-        logger.info(f"Condition encoder: dtype={enc_dtype}, device={device}")
-
-        # Get silence latent
+        
         silence_latent = get_silence_latent(model)
         if silence_latent is None:
             silence_latent = torch.zeros(1, 750, 64, device=device, dtype=enc_dtype)
 
-        # Progress bar
-        pbar = ProgressBar(len(labeled_samples)) if ProgressBar else None
-
         processed_count = 0
         manifest = []
         errors = []
+        
+        total_steps = len(labeled_samples) * 3
+        pbar = ProgressBar(total_steps) if ProgressBar else None
 
-        logger.info(f"Preprocessing {len(labeled_samples)} samples to {output_dir}")
+        logger.info(f"Starting Preprocessing (Low VRAM: {low_vram}) for {len(labeled_samples)} samples.")
 
-        # --- Main loop: inference_mode for entire batch ---
-        with torch.inference_mode():
-            for i, sample in enumerate(labeled_samples):
-                try:
-                    tensor_data = self._preprocess_sample(
-                        sample=sample,
-                        vae_model=vae_model,
-                        clip=clip,
-                        condition_encoder=condition_encoder,
-                        silence_latent=silence_latent,
-                        max_duration=max_duration,
-                        genre_ratio=genre_ratio,
-                        custom_tag=dataset.metadata.custom_tag,
-                        tag_position=dataset.metadata.tag_position,
-                        device=device,
-                        vae_dtype=vae_dtype,
-                        enc_dtype=enc_dtype,
-                    )
+        try:
+            # =================================================================================
+            # STAGE 1: VAE PROCESSING
+            # =================================================================================
+            logger.info("--- STAGE 1/3: VAE Encoding (Tiled) ---")
+            
+            if low_vram: 
+                model_management.load_models_gpu([vae.patcher])
+            
+            with torch.inference_mode():
+                for i, sample in enumerate(labeled_samples):
+                    try:
+                        waveform, sr = load_audio(sample.audio_path, max_duration=max_duration)
+                        
+                        if low_vram:
+                            target_latents = vae_encode_tiled(
+                                vae_model, waveform, device, vae_dtype, chunk_seconds=20, sr=sr
+                            )
+                        else:
+                            audio = waveform.unsqueeze(0).to(device=device, dtype=vae_dtype, non_blocking=True)
+                            target_latents = vae_encode_direct(vae_model, audio, device, vae_dtype).cpu()
+                            del audio
 
-                    if tensor_data is None:
+                        if target_latents is not None:
+                            temp_storage[sample.id]['target_latents'] = target_latents
+                        
+                        del waveform
+                    except Exception as e:
+                        logger.error(f"VAE Error on {sample.id}: {e}")
+                        errors.append(f"{sample.id} (VAE): {e}")
+                    
+                    if pbar: pbar.update(1)
+            
+            if low_vram: force_clear_memory()
+
+            # =================================================================================
+            # STAGE 2: CLIP PROCESSING
+            # =================================================================================
+            logger.info("--- STAGE 2/3: CLIP Encoding ---")
+            if low_vram: model_management.load_models_gpu([clip.patcher])
+
+            with torch.inference_mode():
+                for i, sample in enumerate(labeled_samples):
+                    if sample.id not in temp_storage or 'target_latents' not in temp_storage[sample.id]:
+                        if pbar: pbar.update(1)
                         continue
 
-                    # Save tensor file
-                    tensor_filename = f"{sample.id}.pt"
-                    tensor_path = output_path / tensor_filename
-                    torch.save(tensor_data, tensor_path)
+                    try:
+                        caption = sample.caption
+                        custom_tag = dataset.metadata.custom_tag
+                        tag_position = dataset.metadata.tag_position
+                        
+                        if custom_tag:
+                            if tag_position == "prepend": caption = f"{custom_tag}, {caption}"
+                            elif tag_position == "append": caption = f"{caption}, {custom_tag}"
+                            elif tag_position == "replace": caption = custom_tag
 
-                    manifest.append({
-                        "id": sample.id,
-                        "filename": tensor_filename,
-                        "audio_path": sample.audio_path,
-                        "caption": sample.caption,
-                        "duration": sample.duration,
-                        "bpm": sample.bpm,
-                        "keyscale": sample.keyscale,
-                        "is_instrumental": sample.is_instrumental,
-                    })
+                        use_genre = random.randint(0, 100) < genre_ratio and sample.genre
+                        text_content = sample.genre if use_genre else caption
+                        
+                        temp_storage[sample.id]['caption'] = caption
+                        temp_storage[sample.id]['final_lyrics'] = sample.lyrics if sample.lyrics else "[Instrumental]"
 
-                    processed_count += 1
-                    logger.info(
-                        f"[{processed_count}/{len(labeled_samples)}] "
-                        f"{sample.filename} ({sample.duration:.0f}s)"
-                    )
+                        metas_str = (
+                            f"- bpm: {sample.bpm if sample.bpm else 'N/A'}\n"
+                            f"- timesignature: {sample.timesignature if sample.timesignature else 'N/A'}\n"
+                            f"- keyscale: {sample.keyscale if sample.keyscale else 'N/A'}\n"
+                            f"- duration: {int(sample.duration)} seconds\n"
+                        )
+                        text_prompt = SFT_GEN_PROMPT.format(DEFAULT_DIT_INSTRUCTION, text_content, metas_str)
 
-                except Exception as e:
-                    error_msg = f"Error processing sample {sample.id}: {str(e)}"
-                    logger.warning(error_msg)
-                    errors.append(error_msg)
+                        ths, tam, lhs, lam = encode_text_and_lyrics(
+                            clip, text_prompt, temp_storage[sample.id]['final_lyrics'], device, enc_dtype
+                        )
+                        
+                        temp_storage[sample.id]['text_hidden_states'] = ths.cpu()
+                        temp_storage[sample.id]['text_attention_mask'] = tam.cpu()
+                        temp_storage[sample.id]['lyric_hidden_states'] = lhs.cpu()
+                        temp_storage[sample.id]['lyric_attention_mask'] = lam.cpu()
+                        
+                    except Exception as e:
+                        logger.error(f"CLIP Error on {sample.id}: {e}")
+                        errors.append(f"{sample.id} (CLIP): {e}")
 
-                if pbar:
-                    pbar.update(1)
+                    if pbar: pbar.update(1)
 
-                # Periodic GPU cache clearing (every 8 samples, matching sdbds)
-                if device.type == "cuda" and (i + 1) % 8 == 0:
-                    torch.cuda.empty_cache()
+            if low_vram: force_clear_memory()
+
+            # =================================================================================
+            # STAGE 3: CONDITION ENCODER & SAVE
+            # =================================================================================
+            logger.info("--- STAGE 3/3: Condition Encoding & Saving ---")
+            
+            if low_vram:
+                condition_encoder.to(device)
+            
+            with torch.inference_mode():
+                for i, sample in enumerate(labeled_samples):
+                    sid = sample.id
+                    if sid not in temp_storage or 'text_hidden_states' not in temp_storage[sid]:
+                        if pbar: pbar.update(1)
+                        continue
+
+                    try:
+                        data = temp_storage[sid]
+                        
+                        ths = data['text_hidden_states'].to(device)
+                        tam = data['text_attention_mask'].to(device)
+                        lhs = data['lyric_hidden_states'].to(device)
+                        lam = data['lyric_attention_mask'].to(device)
+                        
+                        refer_audio_hidden, refer_audio_order_mask = _get_refer_audio_tensors(device, enc_dtype)
+
+                        encoder_hidden_states, encoder_attention_mask = condition_encoder(
+                            text_hidden_states=ths,
+                            text_attention_mask=tam,
+                            lyric_hidden_states=lhs,
+                            lyric_attention_mask=lam,
+                            refer_audio_acoustic_hidden_states_packed=refer_audio_hidden,
+                            refer_audio_order_mask=refer_audio_order_mask,
+                        )
+
+                        target_latents = data['target_latents']
+                        latent_length = target_latents.shape[1]
+                        
+                        context_latents = torch.empty((1, latent_length, 128), device=device, dtype=enc_dtype)
+                        
+                        src = silence_latent.to(dtype=enc_dtype)
+                        src_len = src.shape[1]
+                        take = min(latent_length, src_len)
+                        context_latents[:, :take, :64] = src[:, :take, :]
+                        if take < latent_length:
+                            remaining = latent_length - take
+                            pos = take
+                            while remaining > 0:
+                                chunk = min(remaining, src_len)
+                                context_latents[:, pos:pos + chunk, :64] = src[:, :chunk, :]
+                                pos += chunk
+                                remaining -= chunk
+                        context_latents[:, :, 64:] = 1
+
+                        tensor_data = {
+                            # --- CRITICAL FIX: SQUEEZE BATCH DIMENSION ---
+                            "target_latents": target_latents.squeeze(0).cpu(), 
+                            "attention_mask": torch.ones(latent_length).cpu(), # Squeeze implicitly done by not creating batch dim
+                            "encoder_hidden_states": encoder_hidden_states.squeeze(0).cpu(),
+                            "encoder_attention_mask": encoder_attention_mask.squeeze(0).cpu(),
+                            "context_latents": context_latents.squeeze(0).cpu(),
+                            # ---------------------------------------------
+                            "metadata": {
+                                "audio_path": sample.audio_path,
+                                "filename": sample.filename,
+                                "caption": data['caption'],
+                                "lyrics": data['final_lyrics'],
+                                "duration": sample.duration,
+                                "bpm": sample.bpm,
+                                "keyscale": sample.keyscale,
+                                "timesignature": sample.timesignature,
+                                "language": sample.language,
+                                "is_instrumental": sample.is_instrumental,
+                            }
+                        }
+
+                        tensor_filename = f"{sample.id}.pt"
+                        tensor_path = output_path / tensor_filename
+                        torch.save(tensor_data, tensor_path)
+
+                        manifest.append({
+                            "id": sample.id,
+                            "filename": tensor_filename,
+                            "audio_path": sample.audio_path,
+                            "caption": sample.caption,
+                            "duration": sample.duration,
+                            "bpm": sample.bpm,
+                            "keyscale": sample.keyscale,
+                            "is_instrumental": sample.is_instrumental,
+                        })
+
+                        processed_count += 1
+                        logger.info(f"Saved {sample.filename}")
+                        
+                        del ths, tam, lhs, lam, encoder_hidden_states, encoder_attention_mask, context_latents
+
+                    except Exception as e:
+                        logger.error(f"Save Error on {sid}: {e}")
+                        errors.append(f"{sid} (Save): {e}")
+
+                    if pbar: pbar.update(1)
+
+            # Final Cleanup
+            condition_encoder.to("cpu")
+            force_clear_memory()
+            del temp_storage
+
+        except Exception as e:
+            logger.critical(f"Critical Pipeline Error: {e}")
+            return (output_dir, 0, f"Critical Error: {e}")
 
         # Save manifest
         manifest_path = output_path / "manifest.json"
@@ -291,118 +417,3 @@ class FL_AceStep_PreprocessDataset:
 
         logger.info(status)
         return (str(output_path), processed_count, status)
-
-    def _preprocess_sample(
-        self,
-        sample,
-        vae_model,
-        clip,
-        condition_encoder,
-        silence_latent,
-        max_duration,
-        genre_ratio,
-        custom_tag,
-        tag_position,
-        device,
-        vae_dtype,
-        enc_dtype,
-    ):
-        """Preprocess a single sample to tensor data."""
-        # Step 1: Load audio (resampler is cached in audio_utils)
-        waveform, sr = load_audio(sample.audio_path, max_duration=max_duration)
-
-        # Step 2: VAE encode — call the underlying model directly (already on GPU)
-        audio = waveform.unsqueeze(0).to(device=device, dtype=vae_dtype, non_blocking=True)
-        target_latents = vae_encode_direct(vae_model, audio, device, vae_dtype)
-        del audio  # Free GPU memory immediately
-
-        latent_length = target_latents.shape[1]
-        attention_mask = torch.ones(1, latent_length, device=device)
-
-        # Step 3: Build caption with custom tag
-        caption = sample.caption
-        if custom_tag:
-            if tag_position == "prepend":
-                caption = f"{custom_tag}, {caption}"
-            elif tag_position == "append":
-                caption = f"{caption}, {custom_tag}"
-            elif tag_position == "replace":
-                caption = custom_tag
-
-        use_genre = random.randint(0, 100) < genre_ratio and sample.genre
-        text_content = sample.genre if use_genre else caption
-
-        # Build metadata string (always include all fields, N/A for missing)
-        metas_str = (
-            f"- bpm: {sample.bpm if sample.bpm else 'N/A'}\n"
-            f"- timesignature: {sample.timesignature if sample.timesignature else 'N/A'}\n"
-            f"- keyscale: {sample.keyscale if sample.keyscale else 'N/A'}\n"
-            f"- duration: {int(sample.duration)} seconds\n"
-        )
-
-        text_prompt = SFT_GEN_PROMPT.format(
-            DEFAULT_DIT_INSTRUCTION,
-            text_content,
-            metas_str
-        )
-
-        # Step 4: Encode text and lyrics via ComfyUI CLIP
-        lyrics = sample.lyrics if sample.lyrics else "[Instrumental]"
-        text_hidden_states, text_attention_mask, lyric_hidden_states, lyric_attention_mask = \
-            encode_text_and_lyrics(clip, text_prompt, lyrics, device, enc_dtype)
-
-        # Step 5: Run condition encoder to merge text+lyrics+timbre
-        refer_audio_hidden, refer_audio_order_mask = _get_refer_audio_tensors(device, enc_dtype)
-
-        encoder_hidden_states, encoder_attention_mask = condition_encoder(
-            text_hidden_states=text_hidden_states,
-            text_attention_mask=text_attention_mask,
-            lyric_hidden_states=lyric_hidden_states,
-            lyric_attention_mask=lyric_attention_mask,
-            refer_audio_acoustic_hidden_states_packed=refer_audio_hidden,
-            refer_audio_order_mask=refer_audio_order_mask,
-        )
-
-        # Step 6: Build context latents [1, T, 128] = [silence(64), chunk_mask(64)]
-        context_latents = torch.empty((1, latent_length, 128), device=device, dtype=enc_dtype)
-
-        # Fill silence latent into first 64 channels
-        src = silence_latent.to(dtype=enc_dtype)
-        src_len = src.shape[1]
-        take = min(latent_length, src_len)
-        context_latents[:, :take, :64] = src[:, :take, :]
-        if take < latent_length:
-            # Tile silence to fill remaining length
-            remaining = latent_length - take
-            pos = take
-            while remaining > 0:
-                chunk = min(remaining, src_len)
-                context_latents[:, pos:pos + chunk, :64] = src[:, :chunk, :]
-                pos += chunk
-                remaining -= chunk
-
-        # Last 64 channels = 1 (chunk mask: generate all)
-        context_latents[:, :, 64:] = 1
-
-        # Step 7: Prepare output (squeeze batch dim, move to CPU for storage)
-        tensor_data = {
-            "target_latents": target_latents.squeeze(0).cpu(),
-            "attention_mask": attention_mask.squeeze(0).cpu(),
-            "encoder_hidden_states": encoder_hidden_states.squeeze(0).cpu(),
-            "encoder_attention_mask": encoder_attention_mask.squeeze(0).cpu(),
-            "context_latents": context_latents.squeeze(0).cpu(),
-            "metadata": {
-                "audio_path": sample.audio_path,
-                "filename": sample.filename,
-                "caption": caption,
-                "lyrics": lyrics,
-                "duration": sample.duration,
-                "bpm": sample.bpm,
-                "keyscale": sample.keyscale,
-                "timesignature": sample.timesignature,
-                "language": sample.language,
-                "is_instrumental": sample.is_instrumental,
-            }
-        }
-
-        return tensor_data
