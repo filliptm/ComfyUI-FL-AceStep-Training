@@ -60,7 +60,7 @@ class PreprocessedTensorDataset(Dataset):
         # Load manifest
         manifest_path = self.tensor_dir / "manifest.json"
         if manifest_path.exists():
-            with open(manifest_path, "r") as f:
+            with open(manifest_path, "r", encoding="utf-8") as f:
                 manifest = json.load(f)
                 self.samples = manifest.get("samples", [])
         else:
